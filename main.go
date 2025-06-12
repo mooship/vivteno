@@ -18,6 +18,23 @@ import (
 	"github.com/joho/godotenv"
 )
 
+// Constants for configuration and timeouts
+const (
+	DefaultSchedule     = "10s"
+	DefaultTCPTimeout   = 5 * time.Second
+	DefaultSleepBackoff = 10 * time.Second
+	DefaultTCPPort      = "80"
+	HTTPSScheme         = "https://"
+
+	// Time format layouts
+	DisplayTimeFormat = "2006-01-02 15:04:05 MST"
+
+	// Common timestamp field names
+	TimestampField1 = "timestamp"
+	TimestampField2 = "time"
+	TimestampField3 = "date"
+)
+
 // --- Styles (defined once, reused) ---
 var (
 	headerStyle = lipgloss.NewStyle().
@@ -67,10 +84,10 @@ func renderHealthSection(endpoint string, data map[string]any, tz *time.Location
 	var lines []string
 	lines = append(lines, sectionTitle.Render("Health Endpoint:"))
 	for k, v := range data {
-		if s, ok := v.(string); ok && (k == "timestamp" || k == "time" || k == "date") {
+		if s, ok := v.(string); ok && (k == TimestampField1 || k == TimestampField2 || k == TimestampField3) {
 			if tz != nil {
 				if t, err := time.Parse(time.RFC3339, s); err == nil {
-					s = t.In(tz).Format("2006-01-02 15:04:05 MST")
+					s = t.In(tz).Format(DisplayTimeFormat)
 				}
 			}
 			lines = append(lines, fmt.Sprintf("  %s %s", healthKeyStyle.Render(k+":"), healthValueStyle.Render(s)))
@@ -89,7 +106,7 @@ func (m model) Init() tea.Cmd {
 func schedulePing(schedule string) tea.Cmd {
 	dur, err := time.ParseDuration(schedule)
 	if err != nil {
-		dur = 10 * time.Second
+		dur = DefaultSleepBackoff
 	}
 	return func() tea.Msg {
 		time.Sleep(dur)
@@ -100,8 +117,8 @@ func schedulePing(schedule string) tea.Cmd {
 func pingWebsiteCmdWithContext(ctx context.Context, website string) tea.Cmd {
 	return func() tea.Msg {
 		start := time.Now()
-		dialer := &net.Dialer{Timeout: 5 * time.Second}
-		conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(website, "80"))
+		dialer := &net.Dialer{Timeout: DefaultTCPTimeout}
+		conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(website, DefaultTCPPort))
 		if err != nil {
 			return pingResult{"", err}
 		}
@@ -121,7 +138,7 @@ func fetchHealthCmdWithContext(ctx context.Context, website, healthEndpoint stri
 		if healthEndpoint == "" {
 			return healthResultGeneric{nil, fmt.Errorf("health endpoint not configured")}
 		}
-		url := "https://" + website + healthEndpoint
+		url := HTTPSScheme + website + healthEndpoint
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
 			return healthResultGeneric{nil, err}
@@ -203,7 +220,7 @@ func (m model) View() string {
 			now = now.In(m.timezone)
 		}
 		b.WriteString("\n")
-		b.WriteString(renderSection("Last checked:", now.Format("2006-01-02 15:04:05 MST")))
+		b.WriteString(renderSection("Last checked:", now.Format(DisplayTimeFormat)))
 		b.WriteString("\n")
 		// Ping result in green, multiline
 		for i, line := range strings.Split(m.lastPing, "\n") {
@@ -268,7 +285,7 @@ func main() {
 		os.Exit(1)
 	}
 	if schedule == "" {
-		schedule = "10s"
+		schedule = DefaultSchedule
 	}
 	if !isValidSchedule(schedule) {
 		fmt.Printf("Invalid PING_SCHEDULE: %q\n", schedule)
