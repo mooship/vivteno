@@ -51,4 +51,6 @@ Press `q` or `Ctrl+C` to quit.
 
 ## License
 
-GPL-3.0 License.
+This project is open source and available under the GNU General Public License v3.0 (GPL-3.0).
+
+See [LICENSE](./LICENSE) for details.
