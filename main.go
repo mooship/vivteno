@@ -35,7 +35,7 @@ const (
 	TimestampField3 = "date"
 )
 
-// --- Styles (defined once, reused) ---
+// --- Styles ---
 var (
 	headerStyle = lipgloss.NewStyle().
 			Bold(true).
@@ -80,7 +80,7 @@ func renderSection(title, value string) string {
 	return fmt.Sprintf("%s %s", sectionTitle.Render(title), infoStyle.Render(value))
 }
 
-func renderHealthSection(endpoint string, data map[string]any, tz *time.Location) string {
+func renderHealthSection(data map[string]any, tz *time.Location) string {
 	var lines []string
 	lines = append(lines, sectionTitle.Render("Health Endpoint:"))
 	for k, v := range data {
@@ -100,27 +100,36 @@ func renderHealthSection(endpoint string, data map[string]any, tz *time.Location
 
 // --- Bubble Tea Model Methods ---
 func (m model) Init() tea.Cmd {
-	return pingWebsiteCmdWithContext(m.ctx, m.website)
+	cmds := make([]tea.Cmd, len(m.websites))
+	for i, website := range m.websites {
+		cmds[i] = pingWebsiteCmdWithContext(m.ctx, website, i)
+	}
+	return tea.Batch(cmds...)
 }
 
-func schedulePing(schedule string) tea.Cmd {
+func schedulePing(schedule string, idx int) tea.Cmd {
 	dur, err := time.ParseDuration(schedule)
 	if err != nil {
 		dur = DefaultSleepBackoff
 	}
 	return func() tea.Msg {
 		time.Sleep(dur)
-		return tickMsg(time.Now())
+		return tickMsgWithIndex{Time: time.Now(), Index: idx}
 	}
 }
 
-func pingWebsiteCmdWithContext(ctx context.Context, website string) tea.Cmd {
+type tickMsgWithIndex struct {
+	Time  time.Time
+	Index int
+}
+
+func pingWebsiteCmdWithContext(ctx context.Context, website string, idx int) tea.Cmd {
 	return func() tea.Msg {
 		start := time.Now()
 		dialer := &net.Dialer{Timeout: DefaultTCPTimeout}
 		conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(website, DefaultTCPPort))
 		if err != nil {
-			return pingResult{"", err}
+			return pingResultWithIndex{Result: "", Err: err, Index: idx}
 		}
 		_ = conn.Close()
 		elapsed := time.Since(start)
@@ -129,65 +138,78 @@ func pingWebsiteCmdWithContext(ctx context.Context, website string) tea.Cmd {
 			website,
 			elapsed.Milliseconds(),
 		)
-		return pingResult{result, nil}
+		return pingResultWithIndex{Result: result, Err: nil, Index: idx}
 	}
 }
 
-func fetchHealthCmdWithContext(ctx context.Context, website, healthEndpoint string) tea.Cmd {
+func fetchHealthCmdWithContext(ctx context.Context, website, healthEndpoint string, idx int) tea.Cmd {
 	return func() tea.Msg {
 		if healthEndpoint == "" {
-			return healthResultGeneric{nil, fmt.Errorf("health endpoint not configured")}
+			return healthResultGenericWithIndex{Data: nil, Err: fmt.Errorf("health endpoint not configured"), Index: idx}
 		}
 		url := HTTPSScheme + website + healthEndpoint
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
-			return healthResultGeneric{nil, err}
+			return healthResultGenericWithIndex{Data: nil, Err: err, Index: idx}
 		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			return healthResultGeneric{nil, err}
+			return healthResultGenericWithIndex{Data: nil, Err: err, Index: idx}
 		}
 		defer resp.Body.Close()
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			return healthResultGeneric{nil, err}
+			return healthResultGenericWithIndex{Data: nil, Err: err, Index: idx}
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return healthResultGeneric{nil, fmt.Errorf("health endpoint HTTP %d: %s", resp.StatusCode, string(body))}
+			return healthResultGenericWithIndex{Data: nil, Err: fmt.Errorf("health endpoint HTTP %d: %s", resp.StatusCode, string(body)), Index: idx}
 		}
 		var data map[string]any
 		if err := json.Unmarshal(body, &data); err != nil {
-			return healthResultGeneric{nil, fmt.Errorf("invalid JSON from health endpoint: %w\nBody: %s", err, string(body))}
+			return healthResultGenericWithIndex{Data: nil, Err: fmt.Errorf("invalid JSON from health endpoint: %w\nBody: %s", err, string(body)), Index: idx}
 		}
-		return healthResultGeneric{data, nil}
+		return healthResultGenericWithIndex{Data: data, Err: nil, Index: idx}
 	}
+}
+
+type pingResultWithIndex struct {
+	Result string
+	Err    error
+	Index  int
+}
+
+type healthResultGenericWithIndex struct {
+	Data  map[string]any
+	Err   error
+	Index int
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tickMsg:
-		return m, pingWebsiteCmdWithContext(m.ctx, m.website)
-	case pingResult:
-		if msg.err != nil {
-			m.lastError = msg.err.Error()
-			m.lastPing = ""
-			m.lastHealthGeneric = nil
-			return m, schedulePing(m.schedule)
+	case tickMsgWithIndex:
+		return m, pingWebsiteCmdWithContext(m.ctx, m.websites[msg.Index], msg.Index)
+	case pingResultWithIndex:
+		if msg.Err != nil {
+			m.lastError[msg.Index] = msg.Err.Error()
+			m.lastPing[msg.Index] = ""
+			m.lastHealthGeneric[msg.Index] = nil
+			return m, schedulePing(m.schedule, msg.Index)
 		}
-		m.lastPing = msg.result
-		m.lastError = ""
-		if m.healthEndpoint != "" {
-			return m, fetchHealthCmdWithContext(m.ctx, m.website, m.healthEndpoint)
+		m.lastPing[msg.Index] = msg.Result
+		m.lastError[msg.Index] = ""
+		// Use per-website health endpoint
+		if len(m.healthEndpoint) > msg.Index && m.healthEndpoint[msg.Index] != "" {
+			return m, fetchHealthCmdWithContext(m.ctx, m.websites[msg.Index], m.healthEndpoint[msg.Index], msg.Index)
 		}
-		return m, schedulePing(m.schedule)
-	case healthResultGeneric:
-		if msg.err == nil {
-			m.lastHealthGeneric = msg.data
+		return m, schedulePing(m.schedule, msg.Index)
+	case healthResultGenericWithIndex:
+		if msg.Err == nil {
+			m.lastHealthGeneric[msg.Index] = msg.Data
 		} else {
-			m.lastHealthGeneric = nil
-			m.lastError = msg.err.Error()
+			m.lastHealthGeneric[msg.Index] = nil
+			m.lastError[msg.Index] = msg.Err.Error()
 		}
-		return m, schedulePing(m.schedule)
+		return m, schedulePing(m.schedule, msg.Index)
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" || msg.String() == "q" {
 			m.quit = true
@@ -207,48 +229,52 @@ func (m model) View() string {
 	b.WriteString(headerStyle.Render(" Vivteno - Website Health Monitor "))
 	b.WriteString("\n\n")
 
-	// Target & Schedule Section
-	b.WriteString(renderSection("Website:", m.website))
-	b.WriteString("\n")
-	b.WriteString(renderSection("Schedule:", m.schedule))
-	b.WriteString("\n")
+	// For each website, render its section
+	for i, website := range m.websites {
+		b.WriteString(renderSection("Website:", website))
+		b.WriteString("\n")
+		b.WriteString(renderSection("Schedule:", m.schedule))
+		b.WriteString("\n")
 
-	// Ping Section
-	if m.lastPing != "" {
-		now := time.Now()
-		if m.timezone != nil {
-			now = now.In(m.timezone)
-		}
-		b.WriteString("\n")
-		b.WriteString(renderSection("Last checked:", now.Format(DisplayTimeFormat)))
-		b.WriteString("\n")
-		// Ping result in green, multiline
-		for i, line := range strings.Split(m.lastPing, "\n") {
-			if i == 0 {
-				b.WriteString(infoStyle.Render(line))
-			} else {
-				b.WriteString("\n" + infoStyle.Render(line))
+		// Ping Section
+		if m.lastPing[i] != "" {
+			now := time.Now()
+			if m.timezone != nil {
+				now = now.In(m.timezone)
 			}
+			b.WriteString("\n")
+			b.WriteString(renderSection("Last checked:", now.Format(DisplayTimeFormat)))
+			b.WriteString("\n")
+			for j, line := range strings.Split(m.lastPing[i], "\n") {
+				if j == 0 {
+					b.WriteString(infoStyle.Render(line))
+				} else {
+					b.WriteString("\n" + infoStyle.Render(line))
+				}
+			}
+			b.WriteString("\n")
 		}
-		b.WriteString("\n")
-	}
 
-	// Health Endpoint Section
-	if m.healthEndpoint != "" && m.lastHealthGeneric != nil {
-		b.WriteString("\n")
-		b.WriteString(renderHealthSection(m.healthEndpoint, m.lastHealthGeneric, m.timezone))
-		b.WriteString("\n")
-	}
+		// Health Endpoint Section
+		if len(m.healthEndpoint) > i && m.healthEndpoint[i] != "" && m.lastHealthGeneric[i] != nil {
+			b.WriteString("\n")
+			b.WriteString(renderHealthSection(m.lastHealthGeneric[i], m.timezone))
+			b.WriteString("\n")
+		}
 
-	// Error Section
-	if m.lastError != "" {
-		b.WriteString("\n")
-		b.WriteString(errorStyle.Render("FAILED: " + m.lastError))
-		b.WriteString("\n")
+		// Error Section
+		if m.lastError[i] != "" {
+			b.WriteString("\n")
+			b.WriteString(errorStyle.Render("FAILED: " + m.lastError[i]))
+			b.WriteString("\n")
+		}
+
+		if len(m.websites) > 1 && i < len(m.websites)-1 {
+			b.WriteString("\n" + strings.Repeat("-", 40) + "\n\n")
+		}
 	}
 
 	// Footer
-	b.WriteString("\n")
 	b.WriteString(footerStyle.Render("Press q or Ctrl+C to quit."))
 
 	return b.String()
@@ -271,18 +297,21 @@ func isValidSchedule(s string) bool {
 // --- Main entrypoint ---
 func main() {
 	_ = godotenv.Load()
-	website := os.Getenv("PING_WEBSITE")
+	websiteEnv := os.Getenv("PING_WEBSITE")
 	schedule := os.Getenv("PING_SCHEDULE")
 	timezone := os.Getenv("TIMEZONE")
-	healthEndpoint := os.Getenv("HEALTH_ENDPOINT")
+	healthEndpointEnv := os.Getenv("HEALTH_ENDPOINT")
 
-	if website == "" {
-		fmt.Println("PING_WEBSITE not set in .env")
+	var websites []string
+	if err := json.Unmarshal([]byte(websiteEnv), &websites); err != nil || len(websites) == 0 {
+		fmt.Println("PING_WEBSITE must be a JSON array of at least one website, e.g. [\"example.com\"]")
 		os.Exit(1)
 	}
-	if !isValidHostname(website) {
-		fmt.Printf("Invalid PING_WEBSITE: %q\n", website)
-		os.Exit(1)
+	for _, w := range websites {
+		if !isValidHostname(w) {
+			fmt.Printf("Invalid website in PING_WEBSITE: %q\n", w)
+			os.Exit(1)
+		}
 	}
 	if schedule == "" {
 		schedule = DefaultSchedule
@@ -304,10 +333,27 @@ func main() {
 		loc = time.Local
 	}
 
+	// Parse HEALTH_ENDPOINT as array or fallback to single value for all
+	var healthEndpoints []string
+	if healthEndpointEnv != "" {
+		// Try to parse as JSON array
+		if err := json.Unmarshal([]byte(healthEndpointEnv), &healthEndpoints); err != nil {
+			// fallback: treat as single endpoint for all
+			healthEndpoints = make([]string, len(websites))
+			for i := range healthEndpoints {
+				healthEndpoints[i] = healthEndpointEnv
+			}
+		} else if len(healthEndpoints) != len(websites) {
+			fmt.Println("HEALTH_ENDPOINT must be a JSON array with the same length as PING_WEBSITE, or a single string.")
+			os.Exit(1)
+		}
+	} else {
+		healthEndpoints = make([]string, len(websites))
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
-	m := initialModel(website, schedule, ctx, cancel)
+	m := initialModel(websites, schedule, healthEndpoints, ctx, cancel)
 	m.timezone = loc
-	m.healthEndpoint = healthEndpoint
 	p := tea.NewProgram(m)
 
 	c := make(chan os.Signal, 1)
